@@ -110,33 +110,58 @@ curl -X POST localhost:8080/api/v1/users \
 
 ## Step 4 — Middleware
 
-**Goal:** Logger, CORS, BodyLimit globally; one custom Request-ID middleware.
+**Goal:** Logger, CORS, BodyLimit globally; two custom middlewares (RequestID + Audit) chained.
 
-### Actions
-1. Add built-in middleware:
-   ```go
-   e.Use(middleware.Logger())
-   e.Use(middleware.CORS())
-   e.Use(middleware.BodyLimit("2M"))
-   ```
-2. Write `RequestIDMiddleware`:
-   - Generate UUID if `X-Request-ID` header absent
-   - Store on context: `c.Set("requestID", id)`
-   - Set response header: `c.Response().Header().Set("X-Request-ID", id)`
-   - Log `[REQ] <id> <method> <path>`
-   - Call `next(c)` and return
-
-### Explanation points
-- Middleware execution order (first registered = outermost)
-- `next(c)` — the chain pattern
-- Difference between global (`e.Use`) and group-scoped middleware
-
-### Verification
+### Middleware chain (registration order = wrapping order)
 ```
-go run main.go
-curl -v http://localhost:8080/api/v1/users
-# Response headers should include X-Request-ID
-# Terminal should show the structured log line
+e.Use(RequestID)          wraps [Audit + RequestLogger + CORS + BodyLimit + handler]
+e.Use(Audit)              wraps [RequestLogger + CORS + BodyLimit + handler]
+e.Use(RequestLogger())    wraps [CORS + BodyLimit + handler]
+e.Use(CORS("*"))          wraps [BodyLimit + handler]
+e.Use(BodyLimit(2MB))     wraps [handler]
+```
+
+On every request the execution flows like this:
+```
+→ RequestID (in)  →  Audit (in)  →  RequestLogger  →  handler
+← RequestID (out) ←  Audit (out) ←  RequestLogger  ←  handler
+```
+
+### Key rule
+If middleware B reads something middleware A writes to context, A must be registered first.
+`Audit` calls `c.Get("requestID")` — so `RequestID` (which calls `c.Set`) must run before it.
+
+### Verification — curl commands
+
+```bash
+# 1. Basic request — watch the server terminal for 3 log lines per hit:
+#    "incoming request" (RequestID, way IN)
+#    "→ AUDIT in"       (Audit, way IN)
+#    "← AUDIT out"      (Audit, way OUT — includes status + duration)
+curl -s http://localhost:8080/
+
+# 2. Confirm X-Request-ID appears in response headers
+curl -sv http://localhost:8080/api/v1/users 2>&1 | grep -i "x-request-id"
+# → < X-Request-ID: <some-uuid>
+
+# 3. Supply your own ID — middleware honours it instead of generating a new one.
+#    Watch the terminal: all three log lines will show YOUR id, not a generated UUID.
+curl -s -H "X-Request-ID: my-trace-abc" http://localhost:8080/
+# response body → {"message":"Echo is alive","request_id":"my-trace-abc"}
+
+# 4. Trigger a 404 — Audit's "← AUDIT out" should log status=404
+curl -s http://localhost:8080/api/v1/users/nonexistent
+# terminal → "← AUDIT out" requestID=... status=404 duration=...
+
+# 5. Confirm CORS header is present
+curl -sv -H "Origin: http://example.com" http://localhost:8080/ 2>&1 | grep -i "access-control"
+# → < Access-Control-Allow-Origin: *
+
+# 6. Trigger the 2 MB body limit — server returns 413
+curl -s -X POST http://localhost:8080/api/v1/users \
+  -H "Content-Type: application/json" \
+  -d "$(python3 -c 'print("{\"name\":\"" + "a"*3000000 + "\"}")')"
+# → 413 Request Entity Too Large
 ```
 
 ---
