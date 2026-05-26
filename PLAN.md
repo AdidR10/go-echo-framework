@@ -192,17 +192,47 @@ curl -s -X POST http://localhost:8080/api/v1/users \
 - JWT claims: `sub`, `exp`, custom fields
 - Why middleware is applied to the group, not globally
 
-### Verification
-```
-# get token
-TOKEN=$(curl -s -X POST localhost:8080/login \
-  -d '{"email":"admin@example.com","password":"secret"}' | jq -r .token)
+### Verification — curl commands
 
-# use token
-curl -H "Authorization: Bearer $TOKEN" localhost:8080/api/v1/users
+```bash
+# 1. Get a token with valid credentials
+TOKEN=$(curl -s -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"secret"}' | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+echo $TOKEN
 
-# rejected — no token
-curl localhost:8080/api/v1/users   # → 401
+# 2. Wrong password → 401
+curl -s -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"wrong"}'
+# → {"message":"invalid credentials"}
+
+# 3. Hit a protected route WITH the token → 200
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/users
+# → []   (and server terminal logs: [getUsers] called by: admin@example.com)
+
+# 4. Hit a protected route WITHOUT a token → 401
+curl -s http://localhost:8080/api/v1/users
+# → {"message":"missing or malformed token"}
+
+# 5. Send a malformed / tampered token → 401
+curl -s -H "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.fake.payload" \
+  http://localhost:8080/api/v1/users
+# → {"message":"invalid or expired token"}
+
+# 6. Create a user (protected) — must include the token
+curl -s -X POST http://localhost:8080/api/v1/users \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"name":"Alice","email":"alice@example.com","age":30}'
+# → {"id":"<uuid>","name":"Alice",...}
+
+# 7. /login is public — no token needed, and Audit still runs on it
+curl -s -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"secret"}' | grep -o '"token":"[^"]*"'
+# Watch server terminal: you will see [RequestID] and [Audit] log lines
+# but NO JWTAuth log — because JWTAuth is only on the /api/v1 group
 ```
 
 ---

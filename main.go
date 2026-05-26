@@ -9,10 +9,15 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
 )
+
+// jwtSecret is the symmetric key used to sign and verify tokens.
+// In production this comes from an environment variable, never hardcoded.
+var jwtSecret = []byte("super-secret-key")
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
@@ -54,63 +59,29 @@ var (
 
 // ── Custom Middleware ─────────────────────────────────────────────────────────
 
-// RequestID is a middleware that stamps every request with a unique ID.
-//
-// Middleware in Echo is simply a function that wraps a handler:
-//
-//	func(next HandlerFunc) HandlerFunc
-//
-// The inner function is the actual per-request logic. Calling next(c) passes
-// control down the chain — anything before that call runs on the way IN,
-// anything after runs on the way OUT (after the handler has responded).
 func RequestID(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		// Honour an existing ID if the client (or a load balancer) already set one.
 		id := c.Request().Header.Get("X-Request-ID")
 		if id == "" {
 			id = uuid.NewString()
 		}
-
-		// Store on the context so any handler can read it with c.Get("requestID").
 		c.Set("requestID", id)
-
-		// Echo writes response headers lazily, so we must set them before
-		// calling next — once the handler calls c.JSON the headers are flushed.
 		c.Response().Header().Set("X-Request-ID", id)
-
 		fmt.Printf("[RequestID]  IN  id=%-36s  %s %s\n",
 			id, c.Request().Method, c.Request().URL.Path)
-
-		// Hand off to the next middleware/handler in the chain.
 		return next(c)
 	}
 }
 
-// Audit is the second custom middleware. It runs after RequestID, so by the time
-// it executes the context already has "requestID" in it — that's the chain at work.
-//
-// The key pattern to notice: code BEFORE next(c) runs on the way IN (request),
-// code AFTER next(c) runs on the way OUT (response). The handler itself sits
-// between those two halves.
-//
-//	[RequestID] ──► [Audit ──► handler ──► Audit] ──► [RequestID]
-//	               ▲ before              ▲ after
 func Audit(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		// ── WAY IN ──────────────────────────────────────────────────────────
 		start := time.Now()
-
-		// c.Get reads what RequestID already stored — no parameters passed,
-		// just a shared context. This proves the chain shares state.
 		reqID := fmt.Sprintf("%v", c.Get("requestID"))
-
 		fmt.Printf("[Audit]      IN  id=%-36s  %s %s\n",
 			reqID, c.Request().Method, c.Request().URL.Path)
 
-		// ── CALL THE NEXT LAYER (eventually reaches the handler) ─────────────
 		err := next(c)
 
-		// ── WAY OUT ─────────────────────────────────────────────────────────
 		elapsed := time.Since(start)
 		status := http.StatusOK
 		if res, err2 := echo.UnwrapResponse(c.Response()); err2 == nil {
@@ -118,14 +89,110 @@ func Audit(next echo.HandlerFunc) echo.HandlerFunc {
 		}
 		fmt.Printf("[Audit]      OUT id=%-36s  status=%d  duration=%s\n",
 			reqID, status, elapsed)
-
 		return err
 	}
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// JWTAuth is our hand-rolled JWT middleware.
+// It reads the Authorization header, validates the token, and stores
+// the parsed *jwt.Token on the context under the key "user" so handlers
+// can extract claims from it.
+func JWTAuth(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		authHeader := c.Request().Header.Get("Authorization")
 
+		// Header must be exactly "Bearer <token>"
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			return echo.NewHTTPError(http.StatusUnauthorized, "missing or malformed token")
+		}
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+		// jwt.ParseWithClaims validates:
+		//   • the signature (using jwtSecret)
+		//   • the exp claim (token not expired)
+		//   • the algorithm (we only accept HS256 via the keyFunc)
+		token, err := jwt.ParseWithClaims(
+			tokenString,
+			jwt.MapClaims{}, // the shape we expect claims in
+			func(t *jwt.Token) (any, error) {
+				// Guard against algorithm-switching attacks:
+				// reject any token that was not signed with HS256.
+				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+				}
+				return jwtSecret, nil
+			},
+		)
+		if err != nil || !token.Valid {
+			return echo.NewHTTPError(http.StatusUnauthorized, "invalid or expired token")
+		}
+
+		// Store the parsed token so any handler in this group can read claims.
+		c.Set("user", token)
+		return next(c)
+	}
+}
+
+// ── Auth Handler ──────────────────────────────────────────────────────────────
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// POST /login
+// Validates credentials against a hardcoded test user, then signs and
+// returns a JWT valid for 1 hour.
+func login(c *echo.Context) error {
+	var req loginRequest
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+
+	// Hardcoded credentials — in a real app you'd query a database.
+	if req.Email != "admin@example.com" || req.Password != "secret" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "invalid credentials")
+	}
+
+	// Build the claims.
+	// RegisteredClaims covers the standard JWT fields (sub, exp, iat, etc.).
+	// We embed it in a custom struct alongside our own fields.
+	type claims struct {
+		Email string `json:"email"`
+		jwt.RegisteredClaims
+	}
+
+	now := time.Now()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims{
+		Email: req.Email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   req.Email,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(1 * time.Hour)),
+		},
+	})
+
+	signed, err := token.SignedString(jwtSecret)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "could not sign token")
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"token": signed})
+}
+
+// ── User Handlers ─────────────────────────────────────────────────────────────
+
+// GET /api/v1/users
+// Demonstrates reading claims from the token that JWTAuth placed on the context.
 func getUsers(c *echo.Context) error {
+	// Retrieve the token the JWTAuth middleware stored.
+	token := c.Get("user").(*jwt.Token)
+	claims := token.Claims.(jwt.MapClaims)
+
+	// MapClaims["email"] is the field we put in the token during login.
+	callerEmail, _ := claims["email"].(string)
+	fmt.Printf("[getUsers] called by: %s\n", callerEmail)
+
 	search := c.QueryParam("search")
 
 	mu.RLock()
@@ -142,11 +209,9 @@ func getUsers(c *echo.Context) error {
 
 func getUserByID(c *echo.Context) error {
 	id := c.Param("id")
-
 	mu.RLock()
 	u, ok := store[id]
 	mu.RUnlock()
-
 	if !ok {
 		return echo.NewHTTPError(http.StatusNotFound, "user not found")
 	}
@@ -162,25 +227,20 @@ func createUser(c *echo.Context) error {
 		return validationErrors(c, err)
 	}
 	u.ID = uuid.NewString()
-
 	mu.Lock()
 	store[u.ID] = u
 	mu.Unlock()
-
 	return c.JSON(http.StatusCreated, u)
 }
 
 func updateUser(c *echo.Context) error {
 	id := c.Param("id")
-
 	mu.RLock()
 	existing, ok := store[id]
 	mu.RUnlock()
-
 	if !ok {
 		return echo.NewHTTPError(http.StatusNotFound, "user not found")
 	}
-
 	updated := existing
 	if err := c.Bind(&updated); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -189,24 +249,20 @@ func updateUser(c *echo.Context) error {
 		return validationErrors(c, err)
 	}
 	updated.ID = id
-
 	mu.Lock()
 	store[id] = updated
 	mu.Unlock()
-
 	return c.JSON(http.StatusOK, updated)
 }
 
 func deleteUser(c *echo.Context) error {
 	id := c.Param("id")
-
 	mu.Lock()
 	_, ok := store[id]
 	if ok {
 		delete(store, id)
 	}
 	mu.Unlock()
-
 	if !ok {
 		return echo.NewHTTPError(http.StatusNotFound, "user not found")
 	}
@@ -219,51 +275,33 @@ func main() {
 	e := echo.New()
 	e.Validator = &CustomValidator{v: validator.New()}
 
-	// ── Global middleware ────────────────────────────────────────────────────
-	//
-	// e.Use registers middleware that runs on EVERY request, in registration order.
-	// Think of it as a stack of wrappers around your handlers:
-	//
-	//   RequestID → RequestLogger → CORS → BodyLimit → [handler]
-	//
-	// Each layer calls next(c) to pass control inward, then gets control back
-	// when the inner layers return.
-
-	// Our custom middleware — runs first so every subsequent log line can include the ID.
+	// Global middleware — runs on every route including /login
 	e.Use(RequestID)
-	// Audit runs second: it can read "requestID" set by RequestID, wraps the
-	// handler call, and logs the response status on the way out.
 	e.Use(Audit)
-
-	// RequestLogger logs method, path, status, latency after the handler returns.
-	// In Echo v5 this replaces the old middleware.Logger().
 	e.Use(middleware.RequestLogger())
-
-	// CORS adds the Access-Control-Allow-Origin header to every response.
-	// Passing "*" allows all origins — tighten this for production.
 	e.Use(middleware.CORS("*"))
+	e.Use(middleware.BodyLimit(2 * 1024 * 1024))
 
-	// BodyLimit caps the request body at 2 MB. Requests over the limit get a
-	// 413 before they even reach your handler.
-	e.Use(middleware.BodyLimit(2 * 1024 * 1024)) // 2 MB in bytes
-
-	// ── Routes ──────────────────────────────────────────────────────────────
-
-	g := e.Group("/api/v1")
-	g.GET("/users", getUsers)
-	g.GET("/users/:id", getUserByID)
-	g.POST("/users", createUser)
-	g.PUT("/users/:id", updateUser)
-	g.DELETE("/users/:id", deleteUser)
+	// Public route — no JWT required
+	e.POST("/login", login)
 
 	e.GET("/", func(c *echo.Context) error {
-		// Demo: read the request ID our middleware stored on the context.
 		reqID := fmt.Sprintf("%v", c.Get("requestID"))
 		return c.JSON(http.StatusOK, map[string]string{
 			"message":    "Echo is alive",
 			"request_id": reqID,
 		})
 	})
+
+	// Protected group — JWTAuth runs on every route under /api/v1.
+	// Any request without a valid Bearer token is rejected with 401
+	// before it ever reaches a handler.
+	g := e.Group("/api/v1", JWTAuth)
+	g.GET("/users", getUsers)
+	g.GET("/users/:id", getUserByID)
+	g.POST("/users", createUser)
+	g.PUT("/users/:id", updateUser)
+	g.DELETE("/users/:id", deleteUser)
 
 	log.Fatal(e.Start(":8080"))
 }
