@@ -1,0 +1,24 @@
+1) 
+for _, u := range store {
+		if search == "" || strings.Contains(strings.ToLower(u.Name), strings.ToLower(search)) {
+			result = append(result, u)
+		}
+	}
+
+    what is the use of _ here?
+
+2) 
+func getUsers(c *echo.Context) error {
+
+why pointer use? why returning error here?
+
+
+CONFUSION
+
+
+3) if err := c.Bind(&updated); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+
+
+4) there are many types of function in go. study them
