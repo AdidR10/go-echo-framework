@@ -239,56 +239,85 @@ curl -s -X POST http://localhost:8080/login \
 
 ## Step 6 — Centralized Error Handling & Final Structure
 
-**Goal:** Custom global error handler + clean folder layout.
+**Goal:** Custom global error handler + refactor everything into a clean package layout.
 
-### Actions
-
-**Error Handler:**
+### Echo v5 error handler signature
 ```go
-e.HTTPErrorHandler = func(err error, c echo.Context) {
+// v4 (old)  func(err error, c echo.Context)
+// v5 (new)  func(c *echo.Context, err error)  ← parameters swapped, pointer context
+e.HTTPErrorHandler = func(c *echo.Context, err error) {
     code := http.StatusInternalServerError
     msg  := "internal server error"
     if he, ok := err.(*echo.HTTPError); ok {
         code = he.Code
-        msg  = fmt.Sprintf("%v", he.Message)
+        msg  = he.Message   // string in v5, not interface{}
     }
-    c.JSON(code, map[string]interface{}{"error": msg, "status": code})
+    c.JSON(code, map[string]any{"error": msg, "status": code})
 }
 ```
 
-**Final folder structure:**
+### Final folder structure
 ```
 user-api/
-├── main.go                  ← boots Echo, wires everything
+├── main.go                   ← echo.New, error handler, routes.Register, e.Start
 ├── go.mod / go.sum
 ├── PLAN.md
-├── handlers/
-│   ├── user.go              ← CRUD handlers
-│   └── auth.go              ← login handler
-├── middleware/
-│   ├── jwt.go               ← JWT middleware factory
-│   └── request_id.go        ← custom request-ID middleware
+├── config/
+│   └── config.go             ← shared constants (JWT secret)
 ├── models/
-│   └── user.go              ← User struct + CustomValidator
-├── routes/
-│   └── routes.go            ← RegisterRoutes(e *echo.Echo)
-└── store/
-    └── store.go             ← in-memory map + CRUD helpers
+│   └── user.go               ← User struct + CustomValidator
+├── store/
+│   └── store.go              ← in-memory map + CRUD helper functions
+├── handlers/
+│   ├── user.go               ← CRUD handlers + validationErrors helper
+│   └── auth.go               ← login handler
+├── middleware/
+│   ├── request_id.go         ← RequestID middleware
+│   ├── audit.go              ← Audit middleware
+│   └── jwt.go                ← JWTAuth middleware
+└── routes/
+    └── routes.go             ← Register(e) — global middleware + all routes
 ```
 
-**Refactor steps:**
-1. Move `User` struct and validator to `models/user.go`
-2. Move in-memory map + CRUD logic to `store/store.go`
-3. Move handlers to `handlers/user.go` and `handlers/auth.go`
-4. Move middleware to `middleware/`
-5. Create `routes/routes.go` with `RegisterRoutes`
-6. Slim `main.go` down to: create Echo → register error handler → call `routes.RegisterRoutes(e)` → `e.Start(":8080")`
-
-### Verification
+### Package dependency graph
 ```
-go run main.go           # should compile and start cleanly
-go vet ./...             # no issues
-# Re-run the curl flows from Steps 3–5 — all should still work
+main → routes → handlers → store → models
+                         ↘ models
+              → middleware → config
+         handlers/auth  → config
+```
+No circular imports — each package only points inward.
+
+### Verification — curl commands
+```bash
+# Everything from Steps 3–5 must still work after the refactor.
+
+# 1. Start the refactored server
+go run main.go
+go vet ./...           # must be clean
+
+# 2. Get token
+TOKEN=$(curl -s -X POST http://localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"secret"}' | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+# 3. Create user (validation still works)
+curl -s -X POST http://localhost:8080/api/v1/users \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"name":"Alice","email":"alice@example.com","age":30}'
+
+# 4. Trigger custom error handler — 404 with consistent JSON shape
+curl -s http://localhost:8080/api/v1/users/nonexistent \
+  -H "Authorization: Bearer $TOKEN"
+# → {"error":"user not found","status":404}
+
+# 5. Trigger 401 — also goes through custom error handler
+curl -s http://localhost:8080/api/v1/users
+# → {"error":"missing or malformed token","status":401}
+
+# 6. Trigger 500 — any unhandled error returns consistent shape
+# (covered by the fallback in the error handler)
 ```
 
 ---
@@ -297,20 +326,23 @@ go vet ./...             # no issues
 
 | File | Purpose |
 |------|---------|
-| `main.go` | Entry point, evolves each step |
-| `models/user.go` | User struct + validator (Step 3 onward) |
-| `store/store.go` | In-memory store (Step 2 onward) |
-| `handlers/user.go` | CRUD logic (Step 2, refactored Step 6) |
-| `handlers/auth.go` | Login + JWT issue (Step 5) |
-| `middleware/jwt.go` | JWT verification middleware (Step 5) |
-| `middleware/request_id.go` | Custom middleware (Step 4) |
-| `routes/routes.go` | Route registration (Step 6) |
+| `main.go` | Composition root — wires everything, starts server |
+| `config/config.go` | JWT secret shared between auth handler and JWT middleware |
+| `models/user.go` | User struct + CustomValidator |
+| `store/store.go` | Thread-safe in-memory CRUD |
+| `handlers/user.go` | CRUD handlers |
+| `handlers/auth.go` | Login + token signing |
+| `middleware/request_id.go` | RequestID middleware |
+| `middleware/audit.go` | Audit middleware |
+| `middleware/jwt.go` | JWTAuth middleware |
+| `routes/routes.go` | Registers all middleware and routes on the Echo instance |
 
 ## Dependencies
 
 ```
 github.com/labstack/echo/v5
+github.com/labstack/echo/v5/middleware
 github.com/go-playground/validator/v10
 github.com/golang-jwt/jwt/v5
-github.com/google/uuid        ← for generating user IDs and request IDs
+github.com/google/uuid
 ```
